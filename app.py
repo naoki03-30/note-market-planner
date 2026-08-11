@@ -6,7 +6,7 @@ load_dotenv()
 
 import streamlit as st
 
-from collector import collect, connection_test
+from collector import collect
 from analyzer import analyze, aggregate_market_patterns, keyword_candidates
 from planner import pattern_rank, theme_ideas, build_plan
 from db import (
@@ -37,66 +37,49 @@ small,.stCaption{line-height:1.5}
 """, unsafe_allow_html=True)
 
 st.title("📈 note Market Planner")
-st.caption("市場分析 → 勝ちパターン → テーマ → 記事の土台。iPhone / API追加課金なし版")
+st.caption("note市場を分析して、伸びやすいテーマと記事構成を作る")
 
 for k,v in {
     "last_result":None,
     "analysis_rows":[],
     "selected_tag":"",
     "theme_candidates":[],
-    "connection_result":None,
     "market_patterns":[]
 }.items():
     if k not in st.session_state:
         st.session_state[k]=v
 
-tab1,tab2,tab3,tab4,tab5 = st.tabs(["市場分析","勝ち型","企画","実績","データ"])
+tab1,tab2,tab3,tab4,tab5 = st.tabs(["分析","勝ち型","企画","実績","設定"])
 
 with tab1:
     st.subheader("1. 市場を分析する")
-    tag = st.text_input("調べるnoteタグ", value="プロジェクトマネジメント")
+    tag = st.text_input(
+        "調べるnoteタグ",
+        value=st.session_state.selected_tag or "プロジェクトマネジメント"
+    )
     c1,c2 = st.columns(2)
-    days = c1.selectbox("期間", [7,14,30], index=2)
-    max_articles = c2.selectbox("候補数上限", [20,40,60,80,100], index=2)
-    st.info("まず接続テストで記事URLとスキ数が取れるか確認し、成功後に本分析します。")
-    if st.button("接続テスト（数秒）"):
+    days = c1.selectbox("対象期間", [7,14,30], index=2)
+    max_articles = c2.selectbox("取得記事数", [20,40,60,80,100], index=2)
+
+    st.caption(
+        "直近記事を取得し、30スキ以上またはタグ内上位20%の記事を分析します。"
+    )
+
+    if st.button("市場分析を実行", type="primary"):
         try:
-            with st.spinner("noteへの接続を確認しています"):
-                ct = connection_test(tag)
-            st.session_state.connection_result = ct
-        except Exception as e:
-            st.session_state.connection_result = {"method":"ERROR","urls":0,"likes_ok":0,"article_ok":0,"sample":[],"diagnostics":[{"error":str(e)}]}
-
-    ct = st.session_state.connection_result
-    if ct:
-        if ct.get("urls",0) > 0:
-            st.success(
-                f"接続OK：取得方式 {ct.get('method')} / URL {ct.get('urls')}件 / "
-                f"記事確認 {ct.get('article_ok')}件 / スキ取得 {ct.get('likes_ok')}件"
-            )
-            for s in ct.get("sample",[]):
-                if s.get("title"):
-                    st.caption(f"{s.get('likes')}スキ｜{s.get('title')}")
-        else:
-            st.error("記事URLを取得できませんでした。診断情報を確認してください。")
-            with st.expander("診断情報"):
-                st.json(ct.get("diagnostics",[]))
-
-    can_analyze = bool(ct and ct.get("urls",0) > 0)
-
-    if st.button("分析を開始", type="primary", disabled=not can_analyze):
-        try:
-            with st.spinner("note市場を集計しています"):
+            with st.spinner("note市場を分析しています"):
                 result = collect(tag, int(days), int(max_articles))
+
                 rows=[]
                 for art in result["qualified"]:
                     x=analyze(art["title"],art["body"])
                     rows.append({
-                        "url":art["url"],"title":art["title"],"likes":art["likes"],
+                        "url":art["url"],
+                        "title":art["title"],
+                        "likes":art["likes"],
                         **x
                     })
-                    # 市場分析で「分析対象」に選ばれた時点で相対的な勝ち記事。
-                    # 60点は絶対評価として表示に残すが、型保存の必須条件にはしない。
+
                     if x["patterns"]:
                         signals = dict(x["signals"])
                         signals["selection_basis"] = "top20pct_or_30likes"
@@ -105,21 +88,27 @@ with tab1:
                             art["url"], tag, x["total_score"],
                             x["scores"], x["patterns"], signals
                         )
+
                     art["body"]=None
+
                 result["qualified"]=[
-                    {k:v for k,v in a.items() if k!="body"} for a in result["qualified"]
+                    {k:v for k,v in a.items() if k!="body"}
+                    for a in result["qualified"]
                 ]
 
-                # 上位記事群を横断して「市場の勝ち型TOP5」を集計
                 market_patterns = aggregate_market_patterns(rows, top_k=5)
 
                 st.session_state.last_result=result
                 st.session_state.analysis_rows=rows
                 st.session_state.market_patterns=market_patterns
                 st.session_state.selected_tag=tag
-        except Exception as e:
-            st.error("収集に失敗しました。note側の画面構造変更や一時的なアクセス制限の可能性があります。")
-            st.exception(e)
+
+            st.success("市場分析が完了しました。")
+
+        except Exception:
+            st.error(
+                "市場分析に失敗しました。少し時間を空けて再実行してください。"
+            )
 
     r=st.session_state.last_result
     if r:
@@ -127,12 +116,9 @@ with tab1:
         c1.metric("取得",r["found"])
         c2.metric("中央値",int(r["median_likes"]))
         c3.metric("分析対象",len(r["qualified"]))
-        st.caption(f"採用スキ閾値：{int(r['threshold'])}")
         st.caption(
-            f"取得方式：{r.get('method', '-')} / URL検出：{r.get('discovered_urls', 0)} / "
-            f"スキ取得：{r.get('likes_count', 0)} / "
-            f"取得エラー：{r.get('fetch_errors', 0)} / "
-            f"6時間制限スキップ：{r.get('skipped_cooldown', 0)}"
+            f"絶対条件：30スキ以上 / 相対条件：上位{r.get('top_percent',20)}% "
+            f"（境界 {r.get('relative_cutoff',0)}スキ）"
         )
 
         market_patterns = st.session_state.get("market_patterns", [])
@@ -147,14 +133,14 @@ with tab1:
 
         rows=st.session_state.analysis_rows
         if rows:
-            st.markdown("### 高評価記事")
+            st.markdown("### 市場上位記事")
             for x in sorted(rows,key=lambda z:(z["total_score"],z["likes"] or 0),reverse=True):
                 with st.expander(f"{x['total_score']}点｜{x['likes']}スキ｜{x['title'][:45]}"):
                     st.write(x["scores"])
                     st.caption("抽象化した型："+" / ".join(p["pattern_name"] for p in x["patterns"]) if x["patterns"] else "型抽出なし")
                     st.caption(x["url"])
         else:
-            st.warning("条件を満たす記事を取得できませんでした。上の「URL検出」「スキ取得」「取得エラー」を確認してください。")
+            st.warning("今回の条件では分析対象の記事が見つかりませんでした。期間または取得記事数を広げて再実行してください。")
 
 with tab2:
     st.subheader("2. 勝ちパターン")
@@ -193,6 +179,7 @@ with tab2:
 
 with tab3:
     st.subheader("3. 記事企画を作る")
+    st.caption("市場の勝ち型TOP5を優先して、テーマ・タイトル・記事構成を作ります。")
     tagp=st.text_input("テーマ領域",value=st.session_state.selected_tag or "プロジェクトマネジメント",key="plan_tag")
     audience=st.text_input("想定読者",value="若手PM・SE")
     personal=st.text_area(
@@ -273,8 +260,8 @@ with tab4:
             )
 
 with tab5:
-    st.subheader("5. データ管理")
-    st.warning("無料ホスティングではローカルDBが消える場合があります。定期的なバックアップを推奨します。")
+    st.subheader("5. 設定・バックアップ")
+    st.info("分析結果や実績は、定期的にバックアップしておくと安心です。")
     backup=json.dumps(export_all(),ensure_ascii=False,indent=2)
     st.download_button(
         "バックアップJSONを保存",
@@ -282,5 +269,5 @@ with tab5:
         file_name="note_market_planner_backup.json",
         mime="application/json"
     )
-    st.markdown("### このツールが保存しないもの")
+    st.markdown("### プライバシー")
     st.write("・他者記事の本文\n・長文引用\n・有料部分の本文")
