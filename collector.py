@@ -58,7 +58,6 @@ def _client():
         },
         follow_redirects=True,
         timeout=httpx.Timeout(20.0, connect=8.0),
-        http2=True,
     )
 
 def get(url, article_log=True):
