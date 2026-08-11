@@ -52,6 +52,19 @@ CREATE TABLE IF NOT EXISTS plans (
     revenue_yen INTEGER,
     checked_at TEXT
 );
+
+CREATE TABLE IF NOT EXISTS generated_articles (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    plan_id INTEGER NOT NULL,
+    first_pass TEXT NOT NULL,
+    final_pass TEXT NOT NULL,
+    experiences_json TEXT NOT NULL,
+    market_patterns_json TEXT NOT NULL,
+    target_chars INTEGER NOT NULL,
+    paid_boundary TEXT,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY(plan_id) REFERENCES plans(id)
+);
 """
 
 def now_iso():
@@ -186,3 +199,30 @@ def export_all():
         for table in ["article_meta","patterns","plans"]:
             result[table] = [dict(r) for r in con.execute(f"SELECT * FROM {table}").fetchall()]
         return result
+
+
+def save_generated_article(plan_id, first_pass, final_pass, experiences, market_patterns, target_chars, paid_boundary):
+    with connect() as con:
+        cur = con.execute("""
+            INSERT INTO generated_articles(
+                plan_id,first_pass,final_pass,experiences_json,
+                market_patterns_json,target_chars,paid_boundary,created_at
+            ) VALUES(?,?,?,?,?,?,?,?)
+        """, (
+            int(plan_id), first_pass, final_pass,
+            json.dumps(experiences, ensure_ascii=False),
+            json.dumps(market_patterns, ensure_ascii=False),
+            int(target_chars), paid_boundary, now_iso()
+        ))
+        return cur.lastrowid
+
+def list_generated_articles(limit=50):
+    with connect() as con:
+        rows = con.execute("""
+            SELECT g.*, p.title, p.theme
+            FROM generated_articles g
+            JOIN plans p ON p.id=g.plan_id
+            ORDER BY g.id DESC
+            LIMIT ?
+        """, (int(limit),)).fetchall()
+        return [dict(r) for r in rows]

@@ -9,9 +9,10 @@ import streamlit as st
 from collector import collect
 from analyzer import analyze, aggregate_market_patterns, keyword_candidates
 from planner import pattern_rank, theme_ideas, build_plan
+from llm import generate_first_pass, revise_second_pass
 from db import (
     save_patterns, get_patterns, save_plan, list_plans, record_result,
-    performance_by_pattern, export_all
+    performance_by_pattern, export_all, save_generated_article, list_generated_articles
 )
 
 st.set_page_config(
@@ -49,7 +50,7 @@ for k,v in {
     if k not in st.session_state:
         st.session_state[k]=v
 
-tab1,tab2,tab3,tab4,tab5 = st.tabs(["分析","勝ち型","企画","実績","設定"])
+tab1,tab2,tab3,tab4,tab5,tab6 = st.tabs(["分析","勝ち型","企画","記事生成","実績","設定"])
 
 with tab1:
     st.subheader("1. 市場を分析する")
@@ -232,8 +233,147 @@ with tab3:
         if used_ids:
             st.caption("使用した勝ち型ID：" + ", ".join(map(str,used_ids)))
 
+
 with tab4:
-    st.subheader("4. 公開後の結果")
+    st.subheader("4. 記事を自動生成")
+    st.caption("保存済みの企画と勝ち型を使って、第1稿→自己レビュー→第2稿まで自動生成します。")
+
+    plans = list_plans()
+    if not plans:
+        st.info("先に「企画」タブで記事企画を保存してください。")
+    else:
+        plan_labels = {f"#{p['id']} {p['title']}": p for p in plans}
+        selected_label = st.selectbox("使う記事企画", list(plan_labels.keys()), key="writer_plan")
+        selected_plan_row = plan_labels[selected_label]
+
+        try:
+            selected_outline = json.loads(selected_plan_row["outline_json"])
+        except Exception:
+            selected_outline = []
+
+        selected_plan = {
+            "theme": selected_plan_row["theme"],
+            "title": selected_plan_row["title"],
+            "core_message": selected_plan_row["core_message"],
+            "outline": selected_outline,
+        }
+
+        st.markdown(f"### {selected_plan['title']}")
+        st.caption(selected_plan["core_message"])
+
+        st.markdown("#### あなたの実体験・主張")
+        st.caption("ここを具体的に入れるほど、一般論ではない記事になります。空欄でも生成できます。")
+
+        experience_1 = st.text_area(
+            "実際に見た失敗・違和感",
+            height=100,
+            placeholder="例：課題管理表は更新されていたが、次アクションと意思決定者が曖昧で期限超過が続いた。"
+        )
+        experience_2 = st.text_area(
+            "自分が最重要だと思う原則・判断基準",
+            height=100,
+            placeholder="例：課題は件数ではなく、意思決定が止まっているかで見る。"
+        )
+        experience_3 = st.text_area(
+            "改善前→改善後が分かる具体例",
+            height=120,
+            placeholder="Before / 何を判断したか / Action / After"
+        )
+        experience_4 = st.text_area(
+            "普段使っている確認手順・チェック項目",
+            height=100
+        )
+
+        c1,c2 = st.columns(2)
+        target_chars = c1.selectbox(
+            "目標文字数",
+            [3000,4000,5000,6000],
+            index=1
+        )
+        paid_type = c2.selectbox(
+            "公開形式",
+            ["全編無料","前半無料・後半有料"],
+            index=1
+        )
+
+        if paid_type == "前半無料・後半有料":
+            paid_boundary = st.text_input(
+                "有料に切り替える位置",
+                value="原因・問題提起までは無料。具体的な判断基準・実務手順から有料。"
+            )
+        else:
+            paid_boundary = "全編無料"
+
+        market_patterns = st.session_state.get("market_patterns", [])
+
+        if st.button("第1稿→第2稿まで自動生成", type="primary"):
+            experiences = {
+                "失敗・違和感": experience_1,
+                "最重要原則・判断基準": experience_2,
+                "改善前後の具体例": experience_3,
+                "確認手順・チェック項目": experience_4,
+            }
+
+            try:
+                with st.spinner("第1稿を生成しています"):
+                    first_pass = generate_first_pass(
+                        selected_plan, experiences, market_patterns,
+                        int(target_chars), paid_boundary
+                    )
+
+                with st.spinner("全文を読み直して第2稿に修正しています"):
+                    final_pass = revise_second_pass(
+                        selected_plan, first_pass, market_patterns,
+                        int(target_chars)
+                    )
+
+                article_id = save_generated_article(
+                    selected_plan_row["id"],
+                    first_pass,
+                    final_pass,
+                    experiences,
+                    market_patterns[:5],
+                    int(target_chars),
+                    paid_boundary
+                )
+
+                st.session_state["generated_article"] = {
+                    "id": article_id,
+                    "first_pass": first_pass,
+                    "final_pass": final_pass,
+                    "title": selected_plan["title"],
+                }
+                st.success(f"記事 #{article_id} を生成・保存しました。")
+
+            except Exception as e:
+                st.error("記事生成に失敗しました。APIキー・API残高・モデル設定を確認してください。")
+                st.caption(str(e))
+
+        article = st.session_state.get("generated_article")
+        if article:
+            st.markdown("### 完成稿")
+            st.markdown(article["final_pass"])
+
+            st.download_button(
+                "Markdownで保存",
+                article["final_pass"],
+                file_name=f"note_article_{article['id']}.md",
+                mime="text/markdown"
+            )
+
+            with st.expander("第1稿を見る"):
+                st.markdown(article["first_pass"])
+
+    generated = list_generated_articles(10)
+    if generated:
+        st.markdown("### 最近生成した記事")
+        for g in generated:
+            with st.expander(f"#{g['id']} {g['title']}"):
+                st.markdown(g["final_pass"])
+
+
+with tab5:
+    st.subheader("5. 公開後の結果")
     plans=list_plans()
     if plans:
         labels={f"#{p['id']} {p['title']}":p["id"] for p in plans}
@@ -259,8 +399,14 @@ with tab4:
                 f"売上¥{x['total_revenue_yen']:,} / 使用{x['uses']}回"
             )
 
-with tab5:
-    st.subheader("5. 設定・バックアップ")
+with tab6:
+    st.subheader("6. 設定・バックアップ")
+    st.markdown("### AI記事生成")
+    if os.getenv("OPENAI_API_KEY"):
+        st.success(f"OpenAI API：設定済み / モデル：{os.getenv('OPENAI_MODEL','gpt-5-mini')}")
+    else:
+        st.warning("OpenAI APIキーが未設定です。記事自動生成を使うにはStreamlit Secretsへ設定してください。")
+
     st.info("分析結果や実績は、定期的にバックアップしておくと安心です。")
     backup=json.dumps(export_all(),ensure_ascii=False,indent=2)
     st.download_button(
