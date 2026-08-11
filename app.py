@@ -7,7 +7,7 @@ load_dotenv()
 import streamlit as st
 
 from collector import collect, connection_test
-from analyzer import analyze, keyword_candidates
+from analyzer import analyze, aggregate_market_patterns, keyword_candidates
 from planner import pattern_rank, theme_ideas, build_plan
 from db import (
     save_patterns, get_patterns, save_plan, list_plans, record_result,
@@ -44,7 +44,8 @@ for k,v in {
     "analysis_rows":[],
     "selected_tag":"",
     "theme_candidates":[],
-    "connection_result":None
+    "connection_result":None,
+    "market_patterns":[]
 }.items():
     if k not in st.session_state:
         st.session_state[k]=v
@@ -108,8 +109,13 @@ with tab1:
                 result["qualified"]=[
                     {k:v for k,v in a.items() if k!="body"} for a in result["qualified"]
                 ]
+
+                # 上位記事群を横断して「市場の勝ち型TOP5」を集計
+                market_patterns = aggregate_market_patterns(rows, top_k=5)
+
                 st.session_state.last_result=result
                 st.session_state.analysis_rows=rows
+                st.session_state.market_patterns=market_patterns
                 st.session_state.selected_tag=tag
         except Exception as e:
             st.error("収集に失敗しました。note側の画面構造変更や一時的なアクセス制限の可能性があります。")
@@ -129,6 +135,16 @@ with tab1:
             f"6時間制限スキップ：{r.get('skipped_cooldown', 0)}"
         )
 
+        market_patterns = st.session_state.get("market_patterns", [])
+        if market_patterns:
+            st.markdown("### 市場の勝ち型TOP5")
+            for i,p in enumerate(market_patterns,1):
+                st.write(
+                    f"**{i}. {p['pattern_name']}** — "
+                    f"{p['count']}/{len(st.session_state.analysis_rows)}記事 "
+                    f"({p['rate']}%)"
+                )
+
         rows=st.session_state.analysis_rows
         if rows:
             st.markdown("### 高評価記事")
@@ -142,14 +158,29 @@ with tab1:
 
 with tab2:
     st.subheader("2. 勝ちパターン")
-    st.caption("市場内上位記事から抽象化した型です。60点以上は絶対評価、60点未満でも相対上位なら型を保存します。")
-    ptag=st.text_input("タグで絞る",value=st.session_state.selected_tag,key="pattern_filter")
+    st.caption("直近の分析対象記事を横断し、同じ型が何記事に現れたかで順位付けします。")
+
+    market_patterns = st.session_state.get("market_patterns", [])
+    analyzed_count = len(st.session_state.get("analysis_rows", []))
+
+    if market_patterns:
+        st.markdown("### 勝ち型TOP5")
+        for i,p in enumerate(market_patterns,1):
+            with st.expander(
+                f"{i}. {p['pattern_name']}｜{p['count']}/{analyzed_count}記事（{p['rate']}%）",
+                expanded=(i <= 3)
+            ):
+                st.write(p["abstract_knowledge"])
+                st.caption(
+                    f"該当記事の平均スキ：{p['avg_likes']} / "
+                    f"平均8観点スコア：{p['avg_article_score']}"
+                )
+    else:
+        st.info("市場分析を実行すると、上位記事群の共通パターンTOP5が表示されます。")
+
+    ptag=st.text_input("保存済み知見をタグで絞る",value=st.session_state.selected_tag,key="pattern_filter")
     pats=get_patterns(ptag or None,200)
     if pats:
-        ranked=pattern_rank(pats)
-        st.markdown("### よく出る型")
-        for name,count in ranked[:8]:
-            st.write(f"**{name}** — {count}回")
         st.markdown("### 保存された抽象知見")
         shown=set()
         for p in pats:
@@ -159,8 +190,6 @@ with tab2:
             with st.expander(f"{p['pattern_name']}｜元記事 {p['total_score']}点"):
                 st.write(p["abstract_knowledge"])
                 st.caption("元本文は保存していません。")
-    else:
-        st.info("まだ勝ちパターンがありません。「市場分析」を実行してください。")
 
 with tab3:
     st.subheader("3. 記事企画を作る")
@@ -174,7 +203,9 @@ with tab3:
     source_rows=st.session_state.analysis_rows
     keywords=keyword_candidates(source_rows)
     patterns=get_patterns(tagp or None,100)
-    pattern_names=[p["pattern_name"] for p in patterns]
+    market_patterns=st.session_state.get("market_patterns", [])
+    top_pattern_names=[p["pattern_name"] for p in market_patterns[:5]]
+    pattern_names=top_pattern_names or [p["pattern_name"] for p in patterns]
     ideas=theme_ideas(tagp,keywords,pattern_names,audience)
 
     st.markdown("### おすすめテーマ")
@@ -192,7 +223,11 @@ with tab3:
             tagp,audience,selected["theme"],selected["title"],
             personal,pattern_names
         )
-        used_ids=[p["id"] for p in patterns[:12]]
+        if top_pattern_names:
+            preferred = [p for p in patterns if p["pattern_name"] in set(top_pattern_names)]
+            used_ids=[p["id"] for p in preferred[:12]]
+        else:
+            used_ids=[p["id"] for p in patterns[:12]]
         plan_id=save_plan(tagp,audience,plan,used_ids)
         st.session_state["current_plan"]=(plan_id,plan,used_ids)
 

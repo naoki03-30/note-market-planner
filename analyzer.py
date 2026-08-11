@@ -1,14 +1,25 @@
-import math
 import re
-from collections import Counter
+from collections import Counter, defaultdict
 
 AXES = ["フック","課題設定","具体性","信頼性","構成","読みやすさ","実行可能性","独自性"]
 
-HOOK_WORDS = ["なぜ","実は","知らない","間違い","勘違い","失敗","やめた","危険","本当","理由","違い","結論"]
-PROBLEM_WORDS = ["課題","問題","悩み","困","失敗","できない","うまくいか","詰ま","炎上","遅延","不足"]
-ACTION_WORDS = ["方法","手順","やり方","チェック","テンプレ","使い方","ポイント","コツ","実践","明日","まず"]
-TRUST_WORDS = ["経験","実務","現場","検証","事例","結果","データ","年","回","件","プロジェクト"]
-STRUCTURE_WORDS = ["まとめ","結論","理由","原因","方法","ポイント","ステップ","最後に"]
+HOOK_WORDS = ["なぜ","実は","知らない","間違い","勘違い","失敗","やめた","危険","本当","理由","違い","結論","でも","ではない"]
+PROBLEM_WORDS = ["課題","問題","悩み","困","失敗","できない","うまくいか","詰ま","炎上","遅延","不足","危険"]
+ACTION_WORDS = ["方法","手順","やり方","チェック","テンプレ","使い方","ポイント","コツ","実践","明日","まず","改善","解決"]
+TRUST_WORDS = ["経験","実務","現場","検証","事例","結果","データ","年","回","件","プロジェクト","実際"]
+STRUCTURE_WORDS = ["まとめ","結論","理由","原因","方法","ポイント","ステップ","最後に","対策","解決"]
+
+PATTERN_KNOWLEDGE = {
+    "認識転換フック":"タイトル・冒頭で読者の常識や思い込みに疑問を置き、続きを読む理由を作る。",
+    "数字入りタイトル":"数字や件数をタイトルに置き、記事で得られる情報量や具体性を直感的に伝える。",
+    "現場課題起点":"定義説明から入らず、読者が遭遇する具体的な困りごとから本題へ入る。",
+    "実体験起点":"筆者自身の経験・失敗・気づきを起点にし、一般論ではなく一次情報として語る。",
+    "問題→原因→解決":"問題を提示し、原因を分解してから、解決策と実行方法へ段階的につなぐ。",
+    "具体例→抽象化":"数値・事例・ケースを示した後に、他の場面でも使える判断基準へ抽象化する。",
+    "明日使える着地":"読了後の行動を、チェックリスト・手順・判断軸など実行可能な単位まで落とす。",
+    "短段落＋小見出し":"文章を短い意味単位に区切り、小見出しや箇条書きで認知負荷を下げる。",
+    "比較・対比型":"AとB、できる人とできない人、Before/Afterなどの対比で違いを明確にする。",
+}
 
 def clamp(x):
     return max(0, min(10, int(round(x))))
@@ -31,6 +42,71 @@ def sentence_lengths(text):
 
 def count_any(text, words):
     return sum(text.count(w) for w in words)
+
+def _pattern_candidates(title, body, hs, nums, bullets, avg_sentence):
+    clean = re.sub(r"\s+", " ", body)
+    intro = clean[:1800]
+    title_l = title.lower()
+    names = []
+
+    def add(name):
+        if name not in names:
+            names.append(name)
+
+    # タイトル・冒頭の認識転換
+    if (
+        any(w in title for w in HOOK_WORDS)
+        or "？" in title or "?" in title
+        or any(x in title for x in ["ではない","なのか","違い","でも"])
+    ):
+        add("認識転換フック")
+
+    # 数字入りタイトル
+    if re.search(r"[0-9０-９]+", title):
+        add("数字入りタイトル")
+
+    # 現場課題起点
+    if count_any(title + intro, PROBLEM_WORDS) >= 2:
+        add("現場課題起点")
+
+    # 実体験
+    first_person = any(x in intro for x in ["私は","僕は","自分は","私が","僕が"])
+    experience = count_any(intro, ["経験","現場","実際","失敗","気づ","学ん","やってき"])
+    if first_person and experience >= 1:
+        add("実体験起点")
+
+    # 問題→原因→解決
+    has_problem = count_any(clean[:5000], PROBLEM_WORDS) >= 2
+    has_reason = count_any(clean[:5000], ["原因","理由","なぜ","背景"]) >= 1
+    has_solution = count_any(clean, ACTION_WORDS) >= 2
+    if has_problem and (has_reason or has_solution):
+        add("問題→原因→解決")
+
+    # 具体例→抽象化
+    concrete = nums >= 3 or count_any(clean, ["例えば","具体例","事例","ケース","実際"]) >= 2
+    abstract = count_any(clean, ["ポイント","判断","共通","つまり","重要","原則","基準"]) >= 2
+    if concrete and abstract:
+        add("具体例→抽象化")
+
+    # 実行可能性
+    if bullets >= 2 or count_any(clean, ["チェックリスト","手順","ステップ","まず","次に","最後に"]) >= 2:
+        add("明日使える着地")
+
+    # 読みやすさ
+    if len(hs) >= 3 or bullets >= 3 or avg_sentence <= 45:
+        add("短段落＋小見出し")
+
+    # 比較・対比
+    if (
+        re.search(r"(vs|VS|と.*の違い|できる.*できない|Before|After|ビフォー|アフター)", title + clean[:2500], re.I)
+        or count_any(title, ["違い","比較"]) >= 1
+    ):
+        add("比較・対比型")
+
+    return [
+        {"pattern_name": name, "abstract_knowledge": PATTERN_KNOWLEDGE[name]}
+        for name in names
+    ]
 
 def analyze(title, body):
     clean = re.sub(r"\s+", " ", body)
@@ -68,51 +144,55 @@ def analyze(title, body):
     }
     total = sum(scores.values())
 
-    patterns = []
-    if scores["フック"] >= 7:
-        patterns.append({
-            "pattern_name":"認識転換フック",
-            "abstract_knowledge":"タイトル・冒頭で読者の常識や思い込みに疑問を置き、続きを読む理由を作る。"
-        })
-    if scores["課題設定"] >= 7:
-        patterns.append({
-            "pattern_name":"現場課題起点",
-            "abstract_knowledge":"定義説明から入らず、読者が遭遇する具体的な困りごとから本題へ入る。"
-        })
-    if scores["具体性"] >= 7:
-        patterns.append({
-            "pattern_name":"具体例→抽象化",
-            "abstract_knowledge":"数値・事例・手順などの具体物を示した後に、再利用できる判断基準へ抽象化する。"
-        })
-    if scores["構成"] >= 7:
-        patterns.append({
-            "pattern_name":"問題→原因→解決",
-            "abstract_knowledge":"問題を提示し、原因を分解してから、解決策と実行方法へ段階的につなぐ。"
-        })
-    if scores["実行可能性"] >= 7:
-        patterns.append({
-            "pattern_name":"明日使える着地",
-            "abstract_knowledge":"読了後の行動を、チェックリスト・手順・判断軸など実行可能な単位まで落とす。"
-        })
-    if scores["信頼性"] >= 7 and scores["独自性"] >= 6:
-        patterns.append({
-            "pattern_name":"実務経験による裏付け",
-            "abstract_knowledge":"一般論だけでなく、経験・検証・具体的な判断材料を用いて主張を裏付ける。"
-        })
-    if scores["読みやすさ"] >= 8:
-        patterns.append({
-            "pattern_name":"短段落＋小見出し",
-            "abstract_knowledge":"文章を短い意味単位に区切り、小見出しと箇条書きで読者の認知負荷を下げる。"
-        })
+    patterns = _pattern_candidates(title, body, hs, nums, bullets, avg_sentence)
 
     signals = {
         "見出し推定数": len(hs),
         "数値表現数": nums,
         "箇条書き推定数": bullets,
         "平均文長": round(avg_sentence,1),
-        "本文文字数": len(clean)
+        "本文文字数": len(clean),
+        "pattern_names": [p["pattern_name"] for p in patterns],
     }
     return {"scores":scores,"total_score":total,"patterns":patterns,"signals":signals}
+
+def aggregate_market_patterns(rows, top_k=5):
+    """
+    分析対象記事群を横断して、何記事に同じ型が出たかを集計。
+    同一記事内で同じ型は1回として数える。
+    """
+    total_articles = len(rows)
+    counts = Counter()
+    score_sum = defaultdict(float)
+    likes_sum = defaultdict(float)
+
+    for row in rows:
+        names = {
+            p.get("pattern_name")
+            for p in row.get("patterns", [])
+            if p.get("pattern_name")
+        }
+        for name in names:
+            counts[name] += 1
+            score_sum[name] += row.get("total_score", 0) or 0
+            likes_sum[name] += row.get("likes", 0) or 0
+
+    results = []
+    for name, count in counts.items():
+        results.append({
+            "pattern_name": name,
+            "count": count,
+            "rate": round((count / total_articles * 100), 1) if total_articles else 0,
+            "abstract_knowledge": PATTERN_KNOWLEDGE.get(name, ""),
+            "avg_article_score": round(score_sum[name] / count, 1),
+            "avg_likes": round(likes_sum[name] / count, 1),
+        })
+
+    results.sort(
+        key=lambda x: (x["count"], x["avg_likes"], x["avg_article_score"]),
+        reverse=True
+    )
+    return results[:top_k]
 
 def keyword_candidates(items, limit=25):
     text = " ".join((x.get("title") or "") for x in items)
