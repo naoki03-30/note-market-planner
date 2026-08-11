@@ -266,19 +266,50 @@ def collect(tag, days=30, max_articles=60):
     ]
 
     median = statistics.median(like_values) if like_values else 0
-    threshold = max(30, median)
 
-    qualified = []
+    # 分析対象:
+    # 1) 30スキ以上の絶対評価
+    # 2) タグ内上位20%の相対評価
+    # のどちらかを満たす記事。最大15件。
+    ranked = sorted(
+        [a for a in recent if isinstance(a.get("likes"), int)],
+        key=lambda x: x["likes"],
+        reverse=True
+    )
+
+    top_n = 0
+    if ranked:
+        top_n = max(1, int(len(ranked) * 0.20 + 0.9999))  # ceil
+    relative_cutoff = ranked[top_n - 1]["likes"] if top_n else 0
+
+    selected_urls = set()
+    selected = []
+
+    for a in ranked:
+        absolute_ok = a["likes"] >= 30
+        relative_ok = a["likes"] >= relative_cutoff if top_n else False
+
+        if absolute_ok or relative_ok:
+            key = a.get("url") or a.get("key")
+            if key and key not in selected_urls:
+                selected_urls.add(key)
+                selected.append(a)
+
+    # 詳細分析しすぎないよう最大15件
+    qualified = selected[:15]
+
+    qualified_keys = {
+        a.get("url") or a.get("key")
+        for a in qualified
+    }
 
     for a in recent:
-        qualifies = (
-            isinstance(a.get("likes"), int)
-            and a["likes"] >= threshold
-        )
+        key = a.get("url") or a.get("key")
+        qualifies = key in qualified_keys
 
         # DBには本文を保存しない
         upsert_article({
-            "url": a.get("url") or a.get("key"),
+            "url": key,
             "tag": tag,
             "title": a.get("title"),
             "author": a.get("author"),
@@ -287,9 +318,6 @@ def collect(tag, days=30, max_articles=60):
             "qualifies": qualifies,
         })
 
-        if qualifies:
-            qualified.append(a)
-
     return {
         "tag": tag,
         "method": "HASHTAG_API" if articles else "NONE",
@@ -297,7 +325,9 @@ def collect(tag, days=30, max_articles=60):
         "found": len(recent),
         "likes_count": len(like_values),
         "median_likes": median,
-        "threshold": threshold,
+        "threshold": 30,
+        "relative_cutoff": relative_cutoff,
+        "top_percent": 20,
         "qualified": qualified,
         "skipped_cooldown": 0,
         "fetch_errors": sum(

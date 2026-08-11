@@ -94,10 +94,15 @@ with tab1:
                         "url":art["url"],"title":art["title"],"likes":art["likes"],
                         **x
                     })
-                    if x["total_score"]>=60 and x["patterns"]:
+                    # 市場分析で「分析対象」に選ばれた時点で相対的な勝ち記事。
+                    # 60点は絶対評価として表示に残すが、型保存の必須条件にはしない。
+                    if x["patterns"]:
+                        signals = dict(x["signals"])
+                        signals["selection_basis"] = "top20pct_or_30likes"
+                        signals["absolute_quality_60plus"] = x["total_score"] >= 60
                         save_patterns(
-                            art["url"],tag,x["total_score"],
-                            x["scores"],x["patterns"],x["signals"]
+                            art["url"], tag, x["total_score"],
+                            x["scores"], x["patterns"], signals
                         )
                     art["body"]=None
                 result["qualified"]=[
@@ -137,6 +142,7 @@ with tab1:
 
 with tab2:
     st.subheader("2. 勝ちパターン")
+    st.caption("市場内上位記事から抽象化した型です。60点以上は絶対評価、60点未満でも相対上位なら型を保存します。")
     ptag=st.text_input("タグで絞る",value=st.session_state.selected_tag,key="pattern_filter")
     pats=get_patterns(ptag or None,200)
     if pats:
