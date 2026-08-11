@@ -91,6 +91,12 @@ with tab1:
         c2.metric("中央値",int(r["median_likes"]))
         c3.metric("分析対象",len(r["qualified"]))
         st.caption(f"採用スキ閾値：{int(r['threshold'])}")
+        st.caption(
+            f"URL検出：{r.get('discovered_urls', 0)} / "
+            f"スキ取得：{r.get('likes_count', 0)} / "
+            f"取得エラー：{r.get('fetch_errors', 0)} / "
+            f"6時間制限スキップ：{r.get('skipped_cooldown', 0)}"
+        )
 
         rows=st.session_state.analysis_rows
         if rows:
@@ -101,7 +107,7 @@ with tab1:
                     st.caption("抽象化した型："+" / ".join(p["pattern_name"] for p in x["patterns"]) if x["patterns"] else "型抽出なし")
                     st.caption(x["url"])
         else:
-            st.warning("条件を満たす記事を取得できませんでした。タグを変えるか、時間を空けて再実行してください。")
+            st.warning("条件を満たす記事を取得できませんでした。上の「URL検出」「スキ取得」「取得エラー」を確認してください。")
 
 with tab2:
     st.subheader("2. 勝ちパターン")
