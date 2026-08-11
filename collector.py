@@ -1,453 +1,307 @@
 import json
 import os
-import re
 import statistics
 import time
 from datetime import datetime, timedelta, timezone
-from html import unescape
-from urllib.parse import quote, urljoin
+from urllib.parse import quote
 
-import feedparser
 import httpx
 from bs4 import BeautifulSoup
 
-from db import last_fetch, mark_fetch, upsert_article
+from db import upsert_article
 
 UA = (
     "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) "
     "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 "
     "Mobile/15E148 Safari/604.1"
 )
-INTERVAL = float(os.getenv("REQUEST_INTERVAL_SECONDS", "1.5"))
-COOLDOWN_HOURS = float(os.getenv("SAME_URL_COOLDOWN_HOURS", "6"))
 
-ARTICLE_RE = re.compile(
-    r"https?://(?:[A-Za-z0-9-]+\.)?note\.com/[^/\s\"'<>]+/n/n[A-Za-z0-9_-]+"
-)
+INTERVAL = float(os.getenv("REQUEST_INTERVAL_SECONDS", "1.2"))
 
-def _clean_url(raw):
-    if not raw:
-        return None
-    s = unescape(str(raw)).replace("\\/", "/").replace("\\u002F", "/").replace("\\u003A", ":")
-    if s.startswith("/"):
-        s = urljoin("https://note.com", s)
-    m = ARTICLE_RE.search(s)
-    return m.group(0).split("?")[0].split("#")[0] if m else None
-
-def _is_article(url):
-    return bool(url and ARTICLE_RE.match(url))
-
-def can_fetch(url):
-    if not _is_article(url):
-        return True
-    last = last_fetch(url)
-    if not last:
-        return True
-    try:
-        return datetime.now(timezone.utc) - datetime.fromisoformat(last) >= timedelta(hours=COOLDOWN_HOURS)
-    except Exception:
-        return True
 
 def _client():
     return httpx.Client(
         headers={
             "User-Agent": UA,
+            "Accept": "application/json,text/plain,*/*",
             "Accept-Language": "ja-JP,ja;q=0.9,en;q=0.5",
-            "Accept": "*/*",
             "Cache-Control": "no-cache",
         },
         follow_redirects=True,
         timeout=httpx.Timeout(20.0, connect=8.0),
     )
 
-def get(url, article_log=True):
-    if article_log and _is_article(url) and not can_fetch(url):
-        return None
+
+def _get_json(url):
     time.sleep(INTERVAL)
     with _client() as c:
         r = c.get(url)
         r.raise_for_status()
-    if article_log and _is_article(url):
-        mark_fetch(url)
-    return r.text
+        return r.json()
 
-def rss_urls(tag):
+
+def _hashtag_api_url(tag, page=1):
     encoded = quote(tag, safe="")
-    return [
-        f"https://note.com/hashtag/{encoded}/rss",
-        f"https://note.com/hashtag/{encoded}?f=new&output=rss",
-    ]
-
-def tag_url(tag):
-    return f"https://note.com/hashtag/{quote(tag, safe='')}?f=new"
-
-def discover_from_rss(tag, max_articles=60):
-    diagnostics = []
-    for url in rss_urls(tag):
-        try:
-            text = get(url, article_log=False)
-            feed = feedparser.loads(text)
-            urls = []
-            for entry in getattr(feed, "entries", []):
-                for candidate in [
-                    getattr(entry, "link", None),
-                    getattr(entry, "id", None),
-                ]:
-                    u = _clean_url(candidate)
-                    if u and u not in urls:
-                        urls.append(u)
-                for link in getattr(entry, "links", []) or []:
-                    if isinstance(link, dict):
-                        u = _clean_url(link.get("href"))
-                        if u and u not in urls:
-                            urls.append(u)
-                if len(urls) >= max_articles:
-                    break
-
-            diagnostics.append({
-                "method": "rss",
-                "url": url,
-                "http_ok": True,
-                "feed_entries": len(getattr(feed, "entries", [])),
-                "urls": len(urls),
-                "bozo": bool(getattr(feed, "bozo", False)),
-            })
-            if urls:
-                return urls[:max_articles], diagnostics
-        except Exception as e:
-            diagnostics.append({
-                "method":"rss","url":url,"http_ok":False,
-                "feed_entries":0,"urls":0,"error":str(e)[:160]
-            })
-    return [], diagnostics
-
-def discover_from_html(tag, max_articles=60):
-    url = tag_url(tag)
-    try:
-        html = get(url, article_log=False)
-    except Exception as e:
-        return [], [{"method":"html","url":url,"http_ok":False,"urls":0,"error":str(e)[:160]}]
-
-    soup = BeautifulSoup(html, "html.parser")
-    urls = []
-
-    def add(x):
-        u = _clean_url(x)
-        if u and u not in urls:
-            urls.append(u)
-
-    for a in soup.find_all("a", href=True):
-        add(a["href"])
-        if len(urls) >= max_articles:
-            break
-
-    raw = unescape(html).replace("\\/", "/").replace("\\u002F", "/").replace("\\u003A", ":")
-    if len(urls) < max_articles:
-        for m in ARTICLE_RE.finditer(raw):
-            add(m.group(0))
-            if len(urls) >= max_articles:
-                break
-
-    diag = [{
-        "method":"html","url":url,"http_ok":True,"html_chars":len(html),
-        "anchor_count":len(soup.find_all("a")),"urls":len(urls)
-    }]
-    return urls[:max_articles], diag
-
-def discover_article_urls(tag, max_articles=60):
-    # 1. RSS優先
-    urls, diag = discover_from_rss(tag, max_articles)
-    if urls:
-        return urls, "RSS", diag
-
-    # 2. HTML fallback
-    urls2, diag2 = discover_from_html(tag, max_articles)
-    diag.extend(diag2)
-    if urls2:
-        return urls2, "HTML", diag
-
-    return [], "NONE", diag
-
-def _walk(obj):
-    if isinstance(obj, dict):
-        for k,v in obj.items():
-            yield k,v
-            yield from _walk(v)
-    elif isinstance(obj, list):
-        for v in obj:
-            yield from _walk(v)
-
-def _find_value(data, names):
-    names = {n.lower() for n in names}
-    for k,v in _walk(data):
-        if str(k).lower() in names and v not in (None, ""):
-            return v
-    return None
-
-def _json_blocks(soup):
-    for s in soup.find_all("script"):
-        txt = s.string or s.get_text()
-        if not txt:
-            continue
-        if s.get("type") in ("application/json","application/ld+json") or s.get("id") == "__NEXT_DATA__" or txt.lstrip().startswith(("{","[")):
-            try:
-                yield json.loads(txt.strip())
-            except Exception:
-                pass
+    return (
+        f"https://note.com/api/v3/hashtags/{encoded}/notes"
+        f"?order=new&page={page}&paid_only=false"
+    )
 
 
-def _parse_int_text(value):
-    if value is None:
+def _find_notes(payload):
+    """
+    note側のレスポンス形が
+      {notes:[...]}
+    または
+      {data:{notes:[...]}}
+    のどちらでも扱う。
+    """
+    if isinstance(payload, dict):
+        if isinstance(payload.get("notes"), list):
+            return payload["notes"], payload
+        data = payload.get("data")
+        if isinstance(data, dict) and isinstance(data.get("notes"), list):
+            return data["notes"], data
+    return [], {}
+
+
+def _to_int(value):
+    if isinstance(value, bool):
         return None
-    s = str(value).strip().replace(",", "")
-    m = re.fullmatch(r"\s*(\d+)\s*", s)
-    return int(m.group(1)) if m else None
-
-
-def _extract_likes_from_buttons(soup):
-    """
-    noteではスキ数が「2」のようにボタン内の数字だけで描画される場合がある。
-    1) 属性に like / スキ があるボタン
-    2) h1直後に現れる数値だけのボタン
-    3) ページ上部の数値だけのボタン
-    の順で拾う。
-    """
-    buttons = soup.find_all("button")
-
-    # 1. like / スキ を示す属性・クラス・周辺情報があるボタン
-    for b in buttons:
-        meta = " ".join([
-            b.get_text(" ", strip=True),
-            str(b.get("aria-label") or ""),
-            str(b.get("title") or ""),
-            str(b.get("data-testid") or ""),
-            " ".join(b.get("class") or []),
-            str(b.get("name") or ""),
-        ]).lower()
-
-        if any(key in meta for key in ["like", "スキ", "suki"]):
-            # ボタン本文
-            n = _parse_int_text(b.get_text(" ", strip=True))
-            if n is not None:
-                return n
-
-            # aria-label/title内の数字
-            for attr in [b.get("aria-label"), b.get("title")]:
-                if attr:
-                    m = re.search(r"(\d[\d,]*)", str(attr))
-                    if m:
-                        return int(m.group(1).replace(",", ""))
-
-            # 子要素の数値
-            for child in b.find_all(["span", "div"]):
-                n = _parse_int_text(child.get_text(" ", strip=True))
-                if n is not None:
-                    return n
-
-    # 2. タイトル(h1)の直後に現れる「数字だけ」のbuttonを優先
-    h1 = soup.find("h1")
-    if h1:
-        for elem in h1.find_all_next(limit=80):
-            if getattr(elem, "name", None) == "button":
-                n = _parse_int_text(elem.get_text(" ", strip=True))
-                if n is not None:
-                    return n
-
-            # 著者名や本文に入りすぎる前に打ち切る
-            if getattr(elem, "name", None) in ("article",):
-                break
-
-    # 3. ページ上部の数値だけbuttonをフォールバック
-    numeric_buttons = []
-    for i, b in enumerate(buttons[:20]):
-        n = _parse_int_text(b.get_text(" ", strip=True))
-        if n is not None:
-            numeric_buttons.append((i, n))
-
-    if numeric_buttons:
-        # 最初の数値ボタンがスキであるケースを優先
-        return numeric_buttons[0][1]
-
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    if isinstance(value, str):
+        s = value.strip().replace(",", "")
+        if s.isdigit():
+            return int(s)
     return None
 
 
-def _extract_likes_from_html_context(html):
-    """
-    'like' / 'スキ' 周辺に数値が埋め込まれているケースを補足。
-    """
-    raw = unescape(html).replace("\\/", "/")
-    patterns = [
-        r'"likeCount"\s*:\s*"?(\d+)"?',
-        r'"likesCount"\s*:\s*"?(\d+)"?',
-        r'"like_count"\s*:\s*"?(\d+)"?',
-        r'"likes_count"\s*:\s*"?(\d+)"?',
-        r'aria-label="[^"]*(?:スキ|like)[^"]*?(\d[\d,]*)[^"]*"',
-        r'title="[^"]*(?:スキ|like)[^"]*?(\d[\d,]*)[^"]*"',
-        r'(?:スキ|like)[^0-9]{0,80}(\d[\d,]*)',
-    ]
-    for p in patterns:
-        m = re.search(p, raw, re.IGNORECASE)
-        if m:
-            try:
-                return int(m.group(1).replace(",", ""))
-            except Exception:
-                pass
+def _pick(d, *names):
+    if not isinstance(d, dict):
+        return None
+    for name in names:
+        if name in d and d[name] not in (None, ""):
+            return d[name]
     return None
 
 
-def extract_article(html, url):
-    soup = BeautifulSoup(html, "html.parser")
-    title = ""
-    author = ""
-    published = None
-    likes = None
+def _body_to_text(body):
+    if not isinstance(body, str):
+        return ""
+    # APIのbodyがHTMLでもプレーンテキストでも対応
+    if "<" in body and ">" in body:
+        return BeautifulSoup(body, "html.parser").get_text("\n", strip=True)
+    return body.strip()
 
-    for data in _json_blocks(soup):
-        if not title:
-            v = _find_value(data, {"headline","title"})
-            if isinstance(v, str):
-                title = v
-        if not published:
-            v = _find_value(data, {"datePublished","publishAt","publishedAt","publish_at"})
-            if isinstance(v, str):
-                published = v
-        if likes is None:
-            v = _find_value(data, {"likeCount","likesCount","like_count","likes_count"})
-            if isinstance(v, (int,float)):
-                likes = int(v)
-            elif isinstance(v, str) and v.replace(",","").isdigit():
-                likes = int(v.replace(",",""))
-        if not author:
-            v = _find_value(data, {"nickname","displayName","authorName"})
-            if isinstance(v, str):
-                author = v
 
-    if not title:
-        m = soup.find("meta", property="og:title") or soup.find("meta", attrs={"name":"twitter:title"})
-        if m:
-            title = m.get("content") or ""
+def _note_to_article(note):
+    """
+    ハッシュタグAPIの1記事をアプリ内部形式へ変換。
+    スキ数は like_count / likeCount だけを採用する。
+    年・価格・日付等の数字は絶対にスキ数として使わない。
+    """
+    if not isinstance(note, dict):
+        return None
 
-    if not published:
-        m = soup.find("meta", property="article:published_time") or soup.find("time", attrs={"datetime":True})
-        if m:
-            published = m.get("content") or m.get("datetime")
+    key = _pick(note, "key", "note_key", "noteKey")
+    title = _pick(note, "name", "title", "headline") or ""
+    published = _pick(note, "publish_at", "publishAt", "published_at", "publishedAt")
+    likes = _to_int(_pick(note, "like_count", "likeCount"))
 
-    # HTMLコンテキスト
-    if likes is None:
-        likes = _extract_likes_from_html_context(html)
+    user = note.get("user") if isinstance(note.get("user"), dict) else {}
+    urlname = _pick(user, "urlname", "url_name", "username")
+    author = _pick(user, "nickname", "name", "display_name") or ""
 
-    # noteの「数字だけのスキボタン」を取得
-    if likes is None:
-        likes = _extract_likes_from_buttons(soup)
+    # URL候補
+    url = _pick(note, "note_url", "url", "share_url")
+    if not url and key and urlname:
+        url = f"https://note.com/{urlname}/n/{key}"
+    elif not url and key:
+        # creator名が取れない場合も識別用URLを持たせる
+        url = f"https://note.com/n/{key}"
 
-    # 最終フォールバック: 表示テキスト
-    if likes is None:
-        page_text = soup.get_text(" ", strip=True)
-        for p in [
-            r"スキ\s*([0-9,]+)",
-            r"([0-9,]+)\s*スキ",
-            r"いいね\s*([0-9,]+)",
-        ]:
-            m = re.search(p, page_text)
-            if m:
-                likes = int(m.group(1).replace(",",""))
-                break
+    body = _body_to_text(_pick(note, "body", "description") or "")
 
-    article = soup.find("article") or soup.find("main")
-    body = article.get_text("\n", strip=True) if article else ""
+    if not key and not url:
+        return None
 
     return {
-        "url":url,
-        "title":title[:500],
-        "author":author[:200],
-        "published_at":published,
-        "likes":likes,
-        "body":body[:50000],
+        "url": url or "",
+        "key": key or "",
+        "title": str(title)[:500],
+        "author": str(author)[:200],
+        "published_at": published,
+        "likes": likes,
+        "body": body[:50000],
     }
 
-def is_recent(published_at, days=30):
+
+def _is_recent(published_at, days=30):
     if not published_at:
+        # 投稿日取得不能時は除外せず、診断可能な状態を維持
         return True
     try:
-        dt = datetime.fromisoformat(str(published_at).replace("Z","+00:00"))
+        dt = datetime.fromisoformat(str(published_at).replace("Z", "+00:00"))
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
-        return dt >= datetime.now(timezone.utc)-timedelta(days=days)
+        return dt >= datetime.now(timezone.utc) - timedelta(days=days)
     except Exception:
         return True
 
+
+def _fetch_hashtag_articles(tag, max_articles=60):
+    """
+    50件/ページを前提に必要ページだけ取得。
+    note内部APIが変更された場合は diagnostics に残す。
+    """
+    articles = []
+    diagnostics = []
+    page = 1
+
+    while len(articles) < max_articles:
+        url = _hashtag_api_url(tag, page)
+
+        try:
+            payload = _get_json(url)
+            notes, meta = _find_notes(payload)
+
+            page_articles = []
+            for note in notes:
+                a = _note_to_article(note)
+                if a:
+                    page_articles.append(a)
+
+            diagnostics.append({
+                "method": "hashtag_api",
+                "page": page,
+                "http_ok": True,
+                "notes": len(notes),
+                "articles": len(page_articles),
+            })
+
+            articles.extend(page_articles)
+
+            # 終端判定
+            is_last = meta.get("is_last_page")
+            next_page = meta.get("next_page")
+
+            if not notes:
+                break
+            if is_last is True:
+                break
+            if next_page in (None, False, 0, "") and len(notes) < 50:
+                break
+
+            # next_page が整数ならそれを使い、それ以外は+1
+            if isinstance(next_page, int) and next_page > page:
+                page = next_page
+            else:
+                page += 1
+
+            # 暴走防止
+            if page > 20:
+                break
+
+        except Exception as e:
+            diagnostics.append({
+                "method": "hashtag_api",
+                "page": page,
+                "http_ok": False,
+                "notes": 0,
+                "articles": 0,
+                "error": str(e)[:180],
+            })
+            break
+
+    return articles[:max_articles], diagnostics
+
+
 def connection_test(tag):
-    urls, method, diagnostics = discover_article_urls(tag, max_articles=5)
-    result = {
-        "method": method,
-        "urls": len(urls),
-        "likes_ok": 0,
-        "article_ok": 0,
-        "sample": [],
+    """
+    接続テスト:
+    HTMLページにはアクセスせず、ハッシュタグAPIの最初の5件だけ確認。
+    """
+    articles, diagnostics = _fetch_hashtag_articles(tag, max_articles=5)
+    sample = articles[:3]
+
+    return {
+        "method": "HASHTAG_API" if articles else "NONE",
+        "urls": len(articles),
+        "article_ok": len(sample),
+        "likes_ok": sum(isinstance(a.get("likes"), int) for a in sample),
+        "sample": [
+            {
+                "title": a.get("title", "")[:80],
+                "likes": a.get("likes"),
+                "url": a.get("url"),
+            }
+            for a in sample
+        ],
         "diagnostics": diagnostics,
     }
-    for url in urls[:3]:
-        try:
-            html = get(url)
-            if html is None:
-                continue
-            a = extract_article(html, url)
-            result["article_ok"] += 1
-            if isinstance(a.get("likes"), int):
-                result["likes_ok"] += 1
-            result["sample"].append({
-                "title":a.get("title","")[:80],
-                "likes":a.get("likes"),
-                "url":url
-            })
-        except Exception as e:
-            result["sample"].append({"url":url,"error":str(e)[:120]})
-    return result
+
 
 def collect(tag, days=30, max_articles=60):
-    urls, method, diagnostics = discover_article_urls(tag, max_articles=max_articles)
+    """
+    ハッシュタグ記事一覧APIから取得 → 期間絞込 → スキ中央値計算 → 選別。
+    like_count以外の数字をスキとして解釈しない。
+    """
+    articles, diagnostics = _fetch_hashtag_articles(
+        tag,
+        max_articles=max_articles
+    )
 
-    transient = []
-    skipped = 0
-    errors = 0
+    recent = [
+        a for a in articles
+        if _is_recent(a.get("published_at"), days)
+    ]
 
-    for url in urls:
-        try:
-            html = get(url)
-            if html is None:
-                skipped += 1
-                continue
-            a = extract_article(html, url)
-            if is_recent(a.get("published_at"), days):
-                transient.append(a)
-        except Exception:
-            errors += 1
+    like_values = [
+        a["likes"]
+        for a in recent
+        if isinstance(a.get("likes"), int)
+    ]
 
-    like_values = [a["likes"] for a in transient if isinstance(a.get("likes"), int)]
     median = statistics.median(like_values) if like_values else 0
     threshold = max(30, median)
 
     qualified = []
-    for a in transient:
-        q = isinstance(a.get("likes"), int) and a["likes"] >= threshold
+
+    for a in recent:
+        qualifies = (
+            isinstance(a.get("likes"), int)
+            and a["likes"] >= threshold
+        )
+
+        # DBには本文を保存しない
         upsert_article({
-            "url":a["url"],"tag":tag,"title":a.get("title"),
-            "author":a.get("author"),"published_at":a.get("published_at"),
-            "likes":a.get("likes"),"qualifies":q
+            "url": a.get("url") or a.get("key"),
+            "tag": tag,
+            "title": a.get("title"),
+            "author": a.get("author"),
+            "published_at": a.get("published_at"),
+            "likes": a.get("likes"),
+            "qualifies": qualifies,
         })
-        if q:
+
+        if qualifies:
             qualified.append(a)
 
     return {
-        "tag":tag,
-        "method":method,
-        "discovered_urls":len(urls),
-        "found":len(transient),
-        "likes_count":len(like_values),
-        "median_likes":median,
-        "threshold":threshold,
-        "qualified":qualified,
-        "skipped_cooldown":skipped,
-        "fetch_errors":errors,
-        "diagnostics":diagnostics,
+        "tag": tag,
+        "method": "HASHTAG_API" if articles else "NONE",
+        "discovered_urls": len(articles),
+        "found": len(recent),
+        "likes_count": len(like_values),
+        "median_likes": median,
+        "threshold": threshold,
+        "qualified": qualified,
+        "skipped_cooldown": 0,
+        "fetch_errors": sum(
+            1 for d in diagnostics if not d.get("http_ok")
+        ),
+        "diagnostics": diagnostics,
     }
