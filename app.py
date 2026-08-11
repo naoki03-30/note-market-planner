@@ -6,7 +6,7 @@ load_dotenv()
 
 import streamlit as st
 
-from collector import collect
+from collector import collect, connection_test
 from analyzer import analyze, keyword_candidates
 from planner import pattern_rank, theme_ideas, build_plan
 from db import (
@@ -43,7 +43,8 @@ for k,v in {
     "last_result":None,
     "analysis_rows":[],
     "selected_tag":"",
-    "theme_candidates":[]
+    "theme_candidates":[],
+    "connection_result":None
 }.items():
     if k not in st.session_state:
         st.session_state[k]=v
@@ -56,8 +57,33 @@ with tab1:
     c1,c2 = st.columns(2)
     days = c1.selectbox("期間", [7,14,30], index=2)
     max_articles = c2.selectbox("候補数上限", [20,40,60,80,100], index=2)
-    st.info("直近記事を取得し、スキ中央値以上かつ30スキ以上だけを詳細分析します。")
-    if st.button("分析を開始", type="primary"):
+    st.info("まず接続テストで記事URLとスキ数が取れるか確認し、成功後に本分析します。")
+    if st.button("接続テスト（数秒）"):
+        try:
+            with st.spinner("noteへの接続を確認しています"):
+                ct = connection_test(tag)
+            st.session_state.connection_result = ct
+        except Exception as e:
+            st.session_state.connection_result = {"method":"ERROR","urls":0,"likes_ok":0,"article_ok":0,"sample":[],"diagnostics":[{"error":str(e)}]}
+
+    ct = st.session_state.connection_result
+    if ct:
+        if ct.get("urls",0) > 0:
+            st.success(
+                f"接続OK：取得方式 {ct.get('method')} / URL {ct.get('urls')}件 / "
+                f"記事確認 {ct.get('article_ok')}件 / スキ取得 {ct.get('likes_ok')}件"
+            )
+            for s in ct.get("sample",[]):
+                if s.get("title"):
+                    st.caption(f"{s.get('likes')}スキ｜{s.get('title')}")
+        else:
+            st.error("記事URLを取得できませんでした。診断情報を確認してください。")
+            with st.expander("診断情報"):
+                st.json(ct.get("diagnostics",[]))
+
+    can_analyze = bool(ct and ct.get("urls",0) > 0)
+
+    if st.button("分析を開始", type="primary", disabled=not can_analyze):
         try:
             with st.spinner("note市場を集計しています"):
                 result = collect(tag, int(days), int(max_articles))
@@ -92,7 +118,7 @@ with tab1:
         c3.metric("分析対象",len(r["qualified"]))
         st.caption(f"採用スキ閾値：{int(r['threshold'])}")
         st.caption(
-            f"URL検出：{r.get('discovered_urls', 0)} / "
+            f"取得方式：{r.get('method', '-')} / URL検出：{r.get('discovered_urls', 0)} / "
             f"スキ取得：{r.get('likes_count', 0)} / "
             f"取得エラー：{r.get('fetch_errors', 0)} / "
             f"6時間制限スキップ：{r.get('skipped_cooldown', 0)}"
